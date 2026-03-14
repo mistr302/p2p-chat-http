@@ -97,6 +97,18 @@ app.get('/find', (req, res) => {
   return res.json({ peer_id: peer.peer_id, username: peer.username });
 });
 
+app.get('/check-availability', (req, res) => {
+  const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+
+  if (!query) {
+    return res.status(400).json({ error: 'q query parameter is required' });
+  }
+
+  const peer = findPeerByUsername.get(query);
+
+  return res.json({ available: !peer });
+});
+
 app.listen(PORT, () => {
   console.log(`server listening on http://localhost:${PORT}`);
 });
