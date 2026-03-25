@@ -55,6 +55,7 @@ async fn register(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    tracing::info!("POST /register");
     let public_key_bytes = match BASE64.decode(&body.public_key) {
         Ok(b) => b,
         Err(_) => {
@@ -171,6 +172,7 @@ async fn register(
 }
 
 async fn health() -> Json<HealthResponse> {
+    tracing::info!("GET /health");
     Json(HealthResponse {
         status: "ok".to_string(),
     })
@@ -180,6 +182,7 @@ async fn find_by_name(
     State(state): State<Arc<AppState>>,
     Query(params): Query<FindQuery>,
 ) -> impl IntoResponse {
+    tracing::info!("GET /find-by-name");
     let query = params.q.unwrap_or_default().trim().to_string();
 
     if query.is_empty() {
@@ -215,6 +218,7 @@ async fn find_by_id(
     State(state): State<Arc<AppState>>,
     Query(params): Query<FindQuery>,
 ) -> impl IntoResponse {
+    tracing::info!("GET /find-by-id");
     let query = params.q.unwrap_or_default().trim().to_string();
 
     if query.is_empty() {
