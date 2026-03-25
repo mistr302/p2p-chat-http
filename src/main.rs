@@ -118,19 +118,86 @@ async fn register(
 
     let peer_id = libp2p_identity::PeerId::from_public_key(&public_key).to_base58();
 
-    let existing = sqlx::query_scalar::<_, String>(
-        "SELECT peer_id FROM peers WHERE peer_id = ? OR username = ? LIMIT 1",
+    // Check if peer_id already exists
+    let existing_peer = sqlx::query_scalar::<_, String>(
+        "SELECT username FROM peers WHERE peer_id = ? LIMIT 1",
     )
     .bind(&peer_id)
+    .fetch_optional(&state.db)
+    .await;
+
+    match existing_peer {
+        Ok(Some(_old_username)) => {
+            // Peer_id exists, update the username
+            // But first check if the new username is taken by a different peer_id
+            let username_taken_by_other = sqlx::query_scalar::<_, String>(
+                "SELECT peer_id FROM peers WHERE username = ? AND peer_id != ? LIMIT 1",
+            )
+            .bind(&username)
+            .bind(&peer_id)
+            .fetch_optional(&state.db)
+            .await;
+
+            match username_taken_by_other {
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        error_json("username already taken by another peer"),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    tracing::error!("register error: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_json("internal server error"),
+                    )
+                        .into_response();
+                }
+                Ok(None) => {}
+            }
+
+            // Update the username for this peer_id
+            if let Err(e) = sqlx::query("UPDATE peers SET username = ? WHERE peer_id = ?")
+                .bind(&username)
+                .bind(&peer_id)
+                .execute(&state.db)
+                .await
+            {
+                tracing::error!("register error: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error_json("internal server error"),
+                )
+                    .into_response();
+            }
+
+            return (StatusCode::OK, Json(PeerResponse { peer_id, username })).into_response();
+        }
+        Err(e) => {
+            tracing::error!("register error: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("internal server error"),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
+    // Peer_id doesn't exist, check if username is taken
+    let username_exists = sqlx::query_scalar::<_, String>(
+        "SELECT peer_id FROM peers WHERE username = ? LIMIT 1",
+    )
     .bind(&username)
     .fetch_optional(&state.db)
     .await;
 
-    match existing {
+    match username_exists {
         Ok(Some(_)) => {
             return (
                 StatusCode::CONFLICT,
-                error_json("peer_id or username already registered"),
+                error_json("username already registered"),
             )
                 .into_response()
         }
@@ -145,6 +212,7 @@ async fn register(
         Ok(None) => {}
     }
 
+    // Insert new peer
     let now = chrono::Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
         "INSERT INTO peers (peer_id, username, public_key, created_at) VALUES (?, ?, ?, ?)",
@@ -402,6 +470,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_same_peer_updates_username() {
+        let app = setup().await;
+
+        // Use the same keypair for both requests
+        let keypair = generate_keypair();
+        let public_key = keypair.public().encode_protobuf();
+        let peer_id = libp2p_identity::PeerId::from_public_key(&keypair.public()).to_base58();
+
+        // First registration with username "alice"
+        let message1 = serde_json::json!({ "username": "alice" }).to_string();
+        let signature1 = keypair.sign(message1.as_bytes()).expect("signing failed");
+        let body1 = serde_json::json!({
+            "public_key": BASE64.encode(&public_key),
+            "message": message1,
+            "signature": BASE64.encode(&signature1),
+        });
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body1.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = response_json(resp).await;
+        assert_eq!(json["username"], "alice");
+        assert_eq!(json["peer_id"], peer_id);
+
+        // Second registration with same peer_id but username "alice_updated"
+        let message2 = serde_json::json!({ "username": "alice_updated" }).to_string();
+        let signature2 = keypair.sign(message2.as_bytes()).expect("signing failed");
+        let body2 = serde_json::json!({
+            "public_key": BASE64.encode(&public_key),
+            "message": message2,
+            "signature": BASE64.encode(&signature2),
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 200 OK (not 201 CREATED)
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = response_json(resp).await;
+        assert_eq!(json["username"], "alice_updated");
+        assert_eq!(json["peer_id"], peer_id);
+    }
+
+    #[tokio::test]
+    async fn register_same_peer_cannot_take_existing_username() {
+        let app = setup().await;
+
+        // Register first peer with username "carol"
+        let body1 = generate_register_body("carol");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body1.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Register second peer with username "dave"
+        let keypair2 = generate_keypair();
+        let public_key2 = keypair2.public().encode_protobuf();
+        let message2 = serde_json::json!({ "username": "dave" }).to_string();
+        let signature2 = keypair2.sign(message2.as_bytes()).expect("signing failed");
+        let body2 = serde_json::json!({
+            "public_key": BASE64.encode(&public_key2),
+            "message": message2,
+            "signature": BASE64.encode(&signature2),
+        });
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Try to update second peer's username to "carol" (already taken by first peer)
+        let message3 = serde_json::json!({ "username": "carol" }).to_string();
+        let signature3 = keypair2.sign(message3.as_bytes()).expect("signing failed");
+        let body3 = serde_json::json!({
+            "public_key": BASE64.encode(&public_key2),
+            "message": message3,
+            "signature": BASE64.encode(&signature3),
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body3.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 409 CONFLICT
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = response_json(resp).await;
+        assert_eq!(json["error"], "username already taken by another peer");
+    }
+
+    #[tokio::test]
     async fn register_duplicate_username_returns_409() {
         let app = setup().await;
         let body = generate_register_body("bob");
@@ -433,7 +626,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let json = response_json(resp).await;
-        assert_eq!(json["error"], "peer_id or username already registered");
+        assert_eq!(json["error"], "username already registered");
     }
 
     #[tokio::test]
